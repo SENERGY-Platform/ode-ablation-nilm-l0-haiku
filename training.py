@@ -32,6 +32,9 @@ _MIN_COVERAGE = pd.Timedelta(minutes=12)
 _MAX_WEATHER_AGE = pd.Timedelta(hours=6)
 _MIN_BUCKETS = 100
 
+# Outdoor temperature below which heating demand starts, in degrees Celsius.
+_HEATING_BASE_C = 18.0
+
 # kWh of register per 15-minute bucket to mean watts: 1 kWh over 0.25 h is 4000 W.
 _WATTS_PER_KWH_PER_BUCKET = 4000.0
 
@@ -39,17 +42,17 @@ _WATTS_PER_KWH_PER_BUCKET = 4000.0
 def design(power_w, temperature_c, hour) -> np.ndarray:
     """The feature matrix, shared by training and by the model's predict().
 
-    Power enters in kW, temperature in degrees Celsius, hour of day in UTC.
+    Power enters in kW, temperature as heating degrees below 18 degrees Celsius
+    (zero above it), hour of day in UTC.
     """
     power_kw = np.asarray(power_w, dtype=float) / 1000.0
-    temperature = np.asarray(temperature_c, dtype=float)
+    heating_degrees = np.maximum(0.0, _HEATING_BASE_C - np.asarray(temperature_c, dtype=float))
     angle = 2.0 * np.pi * np.asarray(hour, dtype=float) / 24.0
     return np.column_stack(
         [
             np.ones_like(power_kw),
             power_kw,
-            temperature,
-            temperature * temperature,
+            heating_degrees,
             np.sin(angle),
             np.cos(angle),
         ]
@@ -146,6 +149,7 @@ def train_model(logger: TrainMlflowLogger, factor: float) -> typing.Optional[Pyt
             "training_window_days": TRAINING_WINDOW.days,
             "transformer_factor": factor,
             "training_buckets": len(data),
+            "temperature_terms": "heating_degrees_18C",
         }
     )
     logger.log_metrics({"train_mae_w": mae, "train_mean_target_w": float(np.mean(y))})
