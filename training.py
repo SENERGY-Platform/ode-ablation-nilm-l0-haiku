@@ -143,6 +143,9 @@ def train_model(logger: TrainMlflowLogger, factor: float) -> typing.Optional[Pyt
         y = data["target_w"].to_numpy()
         coefficients = np.linalg.lstsq(x, y, rcond=None)[0]
         mae = float(np.mean(np.abs(np.maximum(x @ coefficients, 0.0) - y)))
+        # The reference the model has to beat: predicting the training median everywhere,
+        # on the same buckets. A model whose error is no lower than this has learned nothing.
+        constant_mae = float(np.mean(np.abs(y - np.median(y))))
 
     logger.log_params(
         {
@@ -152,5 +155,11 @@ def train_model(logger: TrainMlflowLogger, factor: float) -> typing.Optional[Pyt
             "temperature_terms": "heating_degrees_18C",
         }
     )
-    logger.log_metrics({"train_mae_w": mae, "train_mean_target_w": float(np.mean(y))})
+    logger.log_metrics(
+        {
+            "train_mae_w": mae,
+            "train_mae_constant_w": constant_mae,
+            "train_mean_target_w": float(np.mean(y)),
+        }
+    )
     return CompressorPowerModel(coefficients.tolist())
