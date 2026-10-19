@@ -3,12 +3,13 @@
 Separate from op.py because the two run in different places: op.py runs in the
 operator's own process for every message, while this runs distributed and rarely.
 
-The history is read with provide_historic_data(). The main meter and the weather are
-input topics; the compressor sub-meter is a training topic, so the operator learns
-from it and never receives it at runtime.
+The history is read with provide_historic_data(). The main meter, the heating meter and
+the weather are input topics; the compressor sub-meter is a training topic, so the
+operator learns from it and never receives it at runtime.
 
 The model is a lookup table: the mean compressor draw in each cell of main-meter power
-(quantile bins) crossed with a band of outdoor temperature (heating degrees).
+(quantile bins), heating-meter apparent power (quantile bins) and a band of outdoor
+temperature (heating degrees).
 """
 
 import datetime
@@ -38,8 +39,9 @@ _MIN_BUCKETS = 100
 # Outdoor temperature at and above which there is no heating demand, in degrees Celsius.
 _HEATING_BASE_C = 18.0
 
-# Power is split into this many quantile bins of the training data.
-_POWER_BINS = 12
+# Quantile bins of each power series in the training data.
+_MAIN_BINS = 6
+_HEATING_BINS = 8
 
 # A cell with fewer training buckets than this takes the training mean instead.
 _MIN_CELL = 50
@@ -65,17 +67,25 @@ class CompressorPowerModel(PythonModel):
     in two files. Keep it serialisable: MLflow stores this object.
     """
 
-    def __init__(self, power_edges: typing.List[float], table: typing.List[typing.List[float]]) -> None:
+    def __init__(
+        self,
+        power_edges: typing.List[float],
+        heating_edges: typing.List[float],
+        table: typing.List[typing.List[typing.List[float]]],
+    ) -> None:
         self.power_edges = [float(e) for e in power_edges]
-        self.table = [[float(v) for v in row] for row in table]
+        self.heating_edges = [float(e) for e in heating_edges]
+        self.table = [[[float(v) for v in cell] for cell in band] for band in table]
 
     def predict(self, context, model_input=None, params=None):
         payload = model_input if model_input is not None else context
         power = float(payload["power_w"])
+        heating = float(payload["heating_va"])
         temperature = float(payload["temperature_c"])
-        bin_index = int(np.searchsorted(np.asarray(self.power_edges, dtype=float), power, side="right"))
+        main_bin = int(np.searchsorted(np.asarray(self.power_edges, dtype=float), power, side="right"))
+        heating_bin = int(np.searchsorted(np.asarray(self.heating_edges, dtype=float), heating, side="right"))
         band = int(_band(np.array([temperature]))[0])
-        return float(self.table[band][bin_index])
+        return float(self.table[band][main_bin][heating_bin])
 
 
 def _as_frames(refs) -> typing.List[pd.DataFrame]:
@@ -104,6 +114,13 @@ def _register_power(frame: pd.DataFrame, factor: float) -> pd.Series:
     return (g.loc[good, "inc"] * factor * _WATTS_PER_KWH_PER_BUCKET).rename("power_w")
 
 
+def _heating(frame: pd.DataFrame) -> pd.Series:
+    """Mean apparent power per 15-minute bucket of the heating meter."""
+    f = frame.dropna(subset=["heating_va"])
+    t = pd.to_datetime(f["time"])
+    return f.groupby(t.dt.floor(_BUCKET_FREQ))["heating_va"].mean().rename("heating_va")
+
+
 def _target(frame: pd.DataFrame) -> pd.Series:
     f = frame.dropna(subset=["compressor_w"])
     t = pd.to_datetime(f["time"])
@@ -125,14 +142,19 @@ def train_model(logger: TrainMlflowLogger, factor: float) -> typing.Optional[Pyt
 
     main = next((f for f in inputs if "main_energy" in f.columns), None)
     weather = next((f for f in inputs if "temperature" in f.columns), None)
+    heating = next((f for f in inputs if "heating_va" in f.columns), None)
     target = next((f for f in targets if "compressor_w" in f.columns), None)
-    if main is None or weather is None or target is None:
+    if main is None or weather is None or heating is None or target is None:
         # Explicitly nothing rather than a model fitted on partial data: returning None
         # leaves the previously registered model in place.
         return None
 
     with logger.trace("align buckets"):
-        data = pd.concat([_register_power(main, factor), _target(target)], axis=1, join="inner").dropna()
+        data = pd.concat(
+            [_register_power(main, factor), _heating(heating), _target(target)],
+            axis=1,
+            join="inner",
+        ).dropna()
         temperature = _weather(weather).reindex(data.index, method="ffill", tolerance=_MAX_WEATHER_AGE)
         data["temperature_c"] = temperature.to_numpy()
         data = data.dropna()
@@ -142,22 +164,28 @@ def train_model(logger: TrainMlflowLogger, factor: float) -> typing.Optional[Pyt
 
     with logger.trace("fit"):
         power = data["power_w"].to_numpy(dtype=float)
+        heating_va = data["heating_va"].to_numpy(dtype=float)
         temperature_c = data["temperature_c"].to_numpy(dtype=float)
         y = data["target_w"].to_numpy(dtype=float)
 
-        edges = np.unique(np.quantile(power, np.linspace(0.0, 1.0, _POWER_BINS + 1)[1:-1]))
-        n_bins = len(edges) + 1
-        bins = np.searchsorted(edges, power, side="right")
+        main_edges = np.unique(np.quantile(power, np.linspace(0.0, 1.0, _MAIN_BINS + 1)[1:-1]))
+        heating_edges = np.unique(np.quantile(heating_va, np.linspace(0.0, 1.0, _HEATING_BINS + 1)[1:-1]))
+        n_main = len(main_edges) + 1
+        n_heating = len(heating_edges) + 1
+
+        main_bins = np.searchsorted(main_edges, power, side="right")
+        heating_bins = np.searchsorted(heating_edges, heating_va, side="right")
         bands = _band(temperature_c)
 
-        sums = np.zeros((4, n_bins))
-        counts = np.zeros((4, n_bins))
-        np.add.at(sums, (bands, bins), y)
-        np.add.at(counts, (bands, bins), 1.0)
+        shape = (4, n_main, n_heating)
+        sums = np.zeros(shape)
+        counts = np.zeros(shape)
+        np.add.at(sums, (bands, main_bins, heating_bins), y)
+        np.add.at(counts, (bands, main_bins, heating_bins), 1.0)
         fallback = float(np.mean(y))
         table = np.where(counts >= _MIN_CELL, sums / np.maximum(counts, 1.0), fallback)
 
-        predicted = table[bands, bins]
+        predicted = table[bands, main_bins, heating_bins]
         mae = float(np.mean(np.abs(predicted - y)))
         # The reference the model has to beat: predicting the training median everywhere,
         # on the same buckets.
@@ -168,16 +196,18 @@ def train_model(logger: TrainMlflowLogger, factor: float) -> typing.Optional[Pyt
             "training_window_days": TRAINING_WINDOW.days,
             "transformer_factor": factor,
             "training_buckets": len(data),
-            "power_bins": n_bins,
+            "main_bins": n_main,
+            "heating_bins": n_heating,
             "heating_bands": 4,
             "min_cell_buckets": _MIN_CELL,
+            "heating_input": "heating_va",
         }
     )
     logger.log_metrics(
         {
-            "train_mae_binned_w": mae,
+            "train_mae_heating_w": mae,
             "train_mae_constant_w": constant_mae,
             "train_mean_target_w": fallback,
         }
     )
-    return CompressorPowerModel(edges.tolist(), table.tolist())
+    return CompressorPowerModel(main_edges.tolist(), heating_edges.tolist(), table.tolist())

@@ -2,8 +2,8 @@
 
 The main meter publishes its energy register, not its power. The operator turns the
 register into the mean power of each 15-minute bucket, applies the transformer factor,
-and predicts the compressor's share of that power from the bucket's power, the latest
-outdoor temperature and the hour of day.
+and predicts the compressor's draw from that power, the heating meter's apparent power,
+the latest outdoor temperature and the hour of day.
 
 Three methods are yours. Everything else belongs to Operator Lib.
 """
@@ -59,10 +59,12 @@ class Operator(MLOperator):
     configType = CustomConfig
 
     # "main" carries the main meter's energy register, "weather" the outdoor
-    # temperature. The selector name is what infer() receives.
+    # temperature, "heating" the heating meter's apparent power. The selector name is
+    # what infer() receives.
     selectors = [
         Selector({"name": "main", "args": ["main_energy"]}),
         Selector({"name": "weather", "args": ["temperature"]}),
+        Selector({"name": "heating", "args": ["heating_va"]}),
     ]
 
     def init(self, *args, **kwargs):
@@ -71,6 +73,7 @@ class Operator(MLOperator):
         # the replay and overwrites what train() just recorded.
         self.trained_at: typing.Optional[datetime.datetime] = None
         self.temperature: typing.Optional[float] = None
+        self.heating_va: typing.Optional[float] = None
         self.last_ts: typing.Optional[datetime.datetime] = None
         self.last_energy: typing.Optional[float] = None
         # (bucket boundary, register value interpolated there) of the last boundary seen.
@@ -99,20 +102,26 @@ class Operator(MLOperator):
                 self.temperature = float(value)
             return None, None, None
 
+        if selector == "heating":
+            value = data.get("heating_va")
+            if value is not None:
+                self.heating_va = float(value)
+            return None, None, None
+
         energy = data.get("main_energy")
         if energy is None:
             return None, None, None
 
         closed = self._close_buckets(float(energy), _utc(timestamp))
-        if model is None or self.temperature is None or not closed:
+        if model is None or self.temperature is None or self.heating_va is None or not closed:
             return None, None, None
 
         start, power_w = closed[-1]
         prediction = model.predict(
             {
                 "power_w": power_w,
+                "heating_va": self.heating_va,
                 "temperature_c": self.temperature,
-                "hour": start.hour + start.minute / 60.0,
             }
         )
         return start, {"prediction": prediction}, None
