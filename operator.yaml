@@ -4,7 +4,7 @@
 # so this file is the payload that action sends. Edit it here; it is the source of
 # truth for what the pipeline editor will show.
 name: ode-ablation-nilm-l0-haiku
-description: An ODE-developed analytics operator
+description: Estimates heat pump compressor power from the site main meter, as 15-minute mean watts
 image: ghcr.io/senergy-platform/ode-ablation-nilm-l0-haiku:latest
 
 # Public makes the operator visible to other users of the platform. Registration
@@ -13,9 +13,11 @@ pub: false
 deploymentType: local
 
 # What the pipeline editor offers as inputs. "name" has to match a selector arg in
-# op.py — the two together are how a message reaches infer().
+# op.py. The main meter's energy register and the outdoor temperature.
 inputs:
-  - name: value
+  - name: main_energy
+    type: float
+  - name: temperature
     type: float
 
 # What the operator emits. These are the keys of the dictionary infer() returns.
@@ -26,4 +28,8 @@ outputs:
 # Deployment configuration, matching CustomConfig in op.py.
 config_values:
   - name: retrain_after_s
+    type: int
+  - name: transformer_factor
+    type: float
+  - name: max_gap_s
     type: int
