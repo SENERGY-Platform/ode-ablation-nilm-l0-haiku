@@ -6,6 +6,9 @@ operator's own process for every message, while this runs distributed and rarely
 The history is read with provide_historic_data(). The main meter and the weather are
 input topics; the compressor sub-meter is a training topic, so the operator learns
 from it and never receives it at runtime.
+
+The model is a lookup table: the mean compressor draw in each cell of main-meter power
+(quantile bins) crossed with a band of outdoor temperature (heating degrees).
 """
 
 import datetime
@@ -32,31 +35,27 @@ _MIN_COVERAGE = pd.Timedelta(minutes=12)
 _MAX_WEATHER_AGE = pd.Timedelta(hours=6)
 _MIN_BUCKETS = 100
 
-# Outdoor temperature below which heating demand starts, in degrees Celsius.
+# Outdoor temperature at and above which there is no heating demand, in degrees Celsius.
 _HEATING_BASE_C = 18.0
+
+# Power is split into this many quantile bins of the training data.
+_POWER_BINS = 12
+
+# A cell with fewer training buckets than this takes the training mean instead.
+_MIN_CELL = 50
 
 # kWh of register per 15-minute bucket to mean watts: 1 kWh over 0.25 h is 4000 W.
 _WATTS_PER_KWH_PER_BUCKET = 4000.0
 
 
-def design(power_w, temperature_c, hour) -> np.ndarray:
-    """The feature matrix, shared by training and by the model's predict().
-
-    Power enters in kW, temperature as heating degrees below 18 degrees Celsius
-    (zero above it), hour of day in UTC.
-    """
-    power_kw = np.asarray(power_w, dtype=float) / 1000.0
+def _band(temperature_c: np.ndarray) -> np.ndarray:
+    """Heating band of each temperature: 0 none, 1 up to 5, 2 up to 10, 3 above 10 degrees below base."""
     heating_degrees = np.maximum(0.0, _HEATING_BASE_C - np.asarray(temperature_c, dtype=float))
-    angle = 2.0 * np.pi * np.asarray(hour, dtype=float) / 24.0
-    return np.column_stack(
-        [
-            np.ones_like(power_kw),
-            power_kw,
-            heating_degrees,
-            np.sin(angle),
-            np.cos(angle),
-        ]
-    )
+    return np.select(
+        [heating_degrees <= 0.0, heating_degrees <= 5.0, heating_degrees <= 10.0],
+        [0, 1, 2],
+        default=3,
+    ).astype(int)
 
 
 class CompressorPowerModel(PythonModel):
@@ -66,13 +65,17 @@ class CompressorPowerModel(PythonModel):
     in two files. Keep it serialisable: MLflow stores this object.
     """
 
-    def __init__(self, coefficients: typing.List[float]) -> None:
-        self.coefficients = [float(c) for c in coefficients]
+    def __init__(self, power_edges: typing.List[float], table: typing.List[typing.List[float]]) -> None:
+        self.power_edges = [float(e) for e in power_edges]
+        self.table = [[float(v) for v in row] for row in table]
 
     def predict(self, context, model_input=None, params=None):
         payload = model_input if model_input is not None else context
-        x = design([float(payload["power_w"])], [float(payload["temperature_c"])], [float(payload["hour"])])[0]
-        return max(0.0, float(x @ np.array(self.coefficients)))
+        power = float(payload["power_w"])
+        temperature = float(payload["temperature_c"])
+        bin_index = int(np.searchsorted(np.asarray(self.power_edges, dtype=float), power, side="right"))
+        band = int(_band(np.array([temperature]))[0])
+        return float(self.table[band][bin_index])
 
 
 def _as_frames(refs) -> typing.List[pd.DataFrame]:
@@ -115,7 +118,7 @@ def _weather(frame: pd.DataFrame) -> pd.Series:
 
 
 def train_model(logger: TrainMlflowLogger, factor: float) -> typing.Optional[PythonModel]:
-    """Read the history, align it in 15-minute buckets, fit, and hand back a model."""
+    """Read the history, align it in 15-minute buckets, fit a lookup table, and hand back a model."""
     with logger.trace("read history"):
         inputs = _as_frames(provide_historic_data(TRAINING_WINDOW))
         targets = _as_frames(provide_historic_data(TRAINING_WINDOW, role="training"))
@@ -138,13 +141,26 @@ def train_model(logger: TrainMlflowLogger, factor: float) -> typing.Optional[Pyt
         return None
 
     with logger.trace("fit"):
-        hour = np.asarray(data.index.hour) + np.asarray(data.index.minute) / 60.0
-        x = design(data["power_w"].to_numpy(), data["temperature_c"].to_numpy(), hour)
-        y = data["target_w"].to_numpy()
-        coefficients = np.linalg.lstsq(x, y, rcond=None)[0]
-        mae = float(np.mean(np.abs(np.maximum(x @ coefficients, 0.0) - y)))
+        power = data["power_w"].to_numpy(dtype=float)
+        temperature_c = data["temperature_c"].to_numpy(dtype=float)
+        y = data["target_w"].to_numpy(dtype=float)
+
+        edges = np.unique(np.quantile(power, np.linspace(0.0, 1.0, _POWER_BINS + 1)[1:-1]))
+        n_bins = len(edges) + 1
+        bins = np.searchsorted(edges, power, side="right")
+        bands = _band(temperature_c)
+
+        sums = np.zeros((4, n_bins))
+        counts = np.zeros((4, n_bins))
+        np.add.at(sums, (bands, bins), y)
+        np.add.at(counts, (bands, bins), 1.0)
+        fallback = float(np.mean(y))
+        table = np.where(counts >= _MIN_CELL, sums / np.maximum(counts, 1.0), fallback)
+
+        predicted = table[bands, bins]
+        mae = float(np.mean(np.abs(predicted - y)))
         # The reference the model has to beat: predicting the training median everywhere,
-        # on the same buckets. A model whose error is no lower than this has learned nothing.
+        # on the same buckets.
         constant_mae = float(np.mean(np.abs(y - np.median(y))))
 
     logger.log_params(
@@ -152,14 +168,16 @@ def train_model(logger: TrainMlflowLogger, factor: float) -> typing.Optional[Pyt
             "training_window_days": TRAINING_WINDOW.days,
             "transformer_factor": factor,
             "training_buckets": len(data),
-            "temperature_terms": "heating_degrees_18C",
+            "power_bins": n_bins,
+            "heating_bands": 4,
+            "min_cell_buckets": _MIN_CELL,
         }
     )
     logger.log_metrics(
         {
-            "train_mae_w": mae,
+            "train_mae_binned_w": mae,
             "train_mae_constant_w": constant_mae,
-            "train_mean_target_w": float(np.mean(y)),
+            "train_mean_target_w": fallback,
         }
     )
-    return CompressorPowerModel(coefficients.tolist())
+    return CompressorPowerModel(edges.tolist(), table.tolist())
